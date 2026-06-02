@@ -1,0 +1,197 @@
+library("dplyr")
+library("igraph")
+library("NetHypGeom")
+library("PSICQUIC")
+library("stringr")
+#set pathway
+setwd("~/R/R-4.1.0")
+
+#import databases-------------------------------------------------------------------------
+#ppi<- interactions(psicquic, species="9606",type=NA, ) 
+#saveRDS(ppi,file="ppi.RData")
+ppi_PSICQUIC<-readRDS("ppi.RData")
+edgelist<-read.delim("http://cbdm-01.zdv.uni-mainz.de/~mschaefer/hippie/hippie_current.txt", 
+                     sep="\t",header = FALSE, stringsAsFactors = FALSE)
+
+#construct 0.71 network, estimatate parameters and embed----------------------------------
+net_0.71<-edgelist %>% dplyr::filter(V5 >= 0.71)%>% 
+                       dplyr::select (V1,V3)%>% 
+                       igraph::graph_from_data_frame(directed = FALSE)%>%
+                       igraph::simplify()
+#get the LCC of 0.71 network
+G_net_0.71<-decompose.graph(net_0.71)[[which.max(sapply(decompose.graph(net_0.71),vcount))]]
+N_G_net_0.71<-data.frame(name = igraph::V(G_net_0.71)$name)
+E_G_net_0.71<-igraph::E(G_net_0.71)
+Edgelist_G_net_0.71<-as.data.frame(get.edgelist(G_net_0.71))
+#parameters estimation
+gma<-fit_power_law(degree(G_net_0.71))$alpha #gamma parameter
+c<-transitivity(G_net_0.71,type ="localaverage")#clustering coefficient
+avg_k<-mean(degree(G_net_0.71))#average node degree 
+#----------------parameters estimation
+#estimate Temperature
+psmodels_0.71=list()
+c_psmodels_0.71=list()
+mean_c_psmodels_0.71=NULL
+for (i in 1:10){
+  psmodels_0.71[[i]]<-ps_model(N = 13077, avg.k = 14.24, gma = 2.74, Temp = 0)
+  c_psmodels_0.71[[i]]<-transitivity(psmodels_0.71[[i]][["network"]],type = "localaverage")
+  mean_c_psmodels_0.71<-(mean(c_psmodels_0.71[[i]]))
+  return(mean_c_psmodels_0.71)
+}
+# Some maths by hand here, based on SF3 (LaBNE+HM paper) network 0.71
+# when T=0, c=0.77
+# when T=1, c=0 so the equation is: c=-0.77*T + 0.77
+# when c=0.15 (clustering coefficient of the LCC), T=0.80
+#apply LaBNE+HM 
+#coordinates_giant_net_0.71<-labne_hm(G_net_0.71,gma = 2.74, Temp = 0.80, w = 2*pi)
+#saveRDS(coordinates_giant_net_0.71,file="coordinates_0.71.RData")
+Coord_G_net_0.71<-readRDS("coordinates_0.71.RData")
+
+#evaluate the embedding to the hyperbolic disc------------------------------------
+N <- vcount(G_net_0.71)
+beta <- 1 / (gma - 1) # parameter controlling popularity fading
+m <- round(avg_k/2) # parameter controlling average node degree
+Temp=0.80
+# Connection probability
+conn <- get_conn_probs(G_net_0.71, Coord_G_net_0.71$polar, bins = 20)
+theo <- get_theoretical_conn_probs(conn$dist, N, avg_k, gma, Temp)
+conn <- rbind(conn, theo)
+conn$label <- rep(c("LaBNE+HM", "Theory"), each = 20)
+p_conn <- ggplot(conn, aes(dist, prob, colour = label, shape = label)) + 
+  geom_point(size = 2) + geom_line() +
+  scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x),
+                labels = scales::trans_format("log10",scales::math_format(10^.x))) + 
+  annotation_logticks(sides = "l") +
+  scale_colour_manual(values = c("#339e2b", "#e3196a")) + 
+  labs(x = "Hyperbolic distance", y = "Connection probability") + 
+  theme_bw() + theme(legend.title = element_blank(), 
+                     legend.background = element_blank(), 
+                     legend.justification = c(0, 0), legend.position = c(0, 0))
+p_conn
+#ggexport(p_conn,filename = "p_conn.jpeg",width = 3200,height = 2500,pointsize = 7,res = 400)
+
+# Real degrees vs expected degrees
+degs <- tibble(k = degree(G_net_0.71), exp_k = numeric(N))
+R <- 2*log(N) - 
+  2*log((2*Temp*(1 - exp(-0.5*(1 - beta)*2*log(N))))/(sin(Temp*pi)*m*(1 - beta)))
+for(i in 1:N){
+  # Compute the hyperbolic distance between a node and all others
+  d <- hyperbolic_dist(Coord_G_net_0.71$polar[i, ], Coord_G_net_0.71$polar)
+  # Compute the probability that the node will connect with all others
+  prob <- 1 / (1 + exp((d - R)/(2*Temp)))
+  # Compute the expected node degree
+  degs$exp_k[i] <- sum(prob)
+}
+p_deg <- ggplot(degs, aes(k, round(exp_k))) + geom_point(size = 0.2) +
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                labels = scales::trans_format("log10", scales::math_format())) +
+  scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x), 
+                labels = scales::trans_format("log10", scales::math_format())) +
+  annotation_logticks() + labs(x = "Node degree", y = "Expected node degree") + 
+  theme_bw()
+p_deg
+#ggexport(p_deg,filename = "p_deg.jpeg",width = 3200,height = 2500,pointsize = 7,res = 400)
+
+# Clustering
+epochs <- 10
+cc <- transitivity(G_net_0.71, "average")
+theo_cc <- numeric(epochs)
+#it was runnign 5 days
+for(i in 1:epochs){
+  ps_net <- ps_model(N = N, avg.k = avg_k, gma = gma, Temp = Temp)
+  theo_cc[i] <- transitivity(ps_net$network, "average")
+}
+#saveRDS(ps_net,file="ps_net_clustering.RData")
+ps_net_clustering<-readRDS("ps_net_clustering.RData")
+#saveRDS(theo_cc,file="theo_cc.RData")
+theo_cc<-readRDS("theo_cc.RData")
+clust <- tibble(label = c("Real", "Theory"), cc = c(cc, mean(theo_cc)),
+                err = c(0, sd(theo_cc)))
+dodge <- position_dodge(width = 0.9)
+p_cc <- ggplot(clust, aes(label, cc)) + geom_col(position = dodge, width = 0.5) +
+  geom_errorbar(aes(ymin = cc - err, ymax = cc + err), 
+                position = dodge, width = 0.25) + 
+  labs(x = "", y = "Clustering coefficient") + theme_bw()
+p_cc
+#ggexport(p_cc,filename = "p_cc.jpeg",width = 3000,height = 2500,pointsize = 7,res = 350)
+
+#manipulate data-----------------------------------------------------------------------------
+#import table for annotation from uniprot database
+mapping<-read.table("HUMAN_9606_idmapping_selected.tab",header=FALSE,stringsAsFactors=FALSE,sep="\t") 
+#rename columns of the table
+names(mapping) <- c('UniProtKB-AC','UniProtKB-ID','GeneID (EntrezGene)','RefSeq',
+                    'GI','PDB','GO','UniRef100','UniRef90','UniRef50','UniParc',
+                    'PIR','NCBI-taxon','MIM','UniGene','PubMed','EMBL','EMBL-CDS',
+                    'Ensembl','Ensembl_TRS','Ensembl_PRO','Additional PubMed')
+#import my datasets an add ID row
+my_mapping<-mapping[,c(1,2,3)] 
+
+#Coord_G_net_0.71<-readRDS("coordinates_0.71.RData")
+nodes_hyper_net<-full_join(Coord_G_net_0.71$polar,Coord_G_net_0.71$cartesian,by='id') %>% #get the coor
+                   dplyr::filter(!(id=="")) %>% #remove blank cells
+                   dplyr::mutate(ID = row_number()) %>% #add ID row
+                   dplyr::select(ID, everything()) %>% #reorder columns
+                   dplyr::mutate(id = strsplit(as.character(id), ",")) %>% #split when multiple uniprot ids
+                   tidyr::unnest(id)%>%
+                   dplyr::left_join(my_mapping,by=c("id"="UniProtKB-ID")) 
+                   #dplyr::group_by(ID) %>% #let it splitted to merge later
+                   #dplyr::slice(which.max(!is.na('UniProtKB-AC')))
+
+#take care if you split or not the id uniprot names
+edges_hyper_net<-as.data.frame(get.edgelist(Coord_G_net_0.71$network)) %>%
+                  dplyr::mutate(ID = row_number()) %>%
+                  dplyr::select(ID, everything())%>% #change the order of the columns, ID first column
+                  dplyr::mutate(V1 = strsplit(as.character(V1), ",")) %>%
+                  tidyr::unnest(V1) %>%
+                  dplyr::mutate(V2 = strsplit(as.character(V2), ",")) %>%
+                  tidyr::unnest(V2) %>%
+                  left_join(nodes_hyper_net,by=c("V1"="id"))%>% 
+                  dplyr::rename(ID_int=1,ID_A=4,r_A=5,theta_A=6,
+                                x_A=7,y_A=8,UniProtKB_AC_A=9,GeneID_A=10) %>% 
+                  dplyr::left_join(nodes_hyper_net,by=c("V2"="id")) %>%
+                  dplyr::rename(ID_B=11,r_B=12,theta_B=13,
+                                x_B=14,y_B=15,UniProtKB_AC_B=16,GeneID_B=17)
+
+#manipulate ppi_PSICQUIC columns to merge biogrid database uses GENEID and the rest uniprot ID be careful!!!!!!!
+ppi_PSICQUIC_biogrid<-ppi_PSICQUIC %>% dplyr::select(c(1,2,12,16)) %>%
+                      dplyr::filter(provider=="BioGrid") %>% 
+                      dplyr::distinct() %>%
+                      dplyr::mutate(A = stringr::str_remove_all(A, fixed("entrez gene/locuslink:"))) %>%
+                      dplyr::mutate(B = stringr::str_remove_all(B, fixed("entrez gene/locuslink:"))) %>%
+                      dplyr::right_join(edges_hyper_net,by=c("A"="GeneID_A", "B"="GeneID_B"),keep=TRUE)
+
+ppi_PSICQUIC_rest<-ppi_PSICQUIC %>% dplyr::select(c(1,2,12,16)) %>%
+                   dplyr::filter(!(provider=="BioGrid")) %>% 
+                   dplyr::distinct() %>%
+                   dplyr::mutate(A = stringr::str_remove_all(A, fixed("uniprotkb:"))) %>%
+                   dplyr::mutate(B = stringr::str_remove_all(B, fixed("uniprotkb:"))) %>%
+                   dplyr::right_join(edges_hyper_net,by=c("A"="UniProtKB_AC_A", "B"="UniProtKB_AC_B"),keep=TRUE)
+#final dataset
+dataset<-dplyr::bind_rows(ppi_PSICQUIC_biogrid,ppi_PSICQUIC_rest)%>%
+         dplyr:: select(-c(1,2,4))%>%
+         dplyr::mutate(type = recode(type, 'psi-mi:MI:0407(direct_interaction)' = 'psi-mi:MI:0407(direct interaction)',
+                                     'psi-mi:MI:0414(enzymatic_reaction)' = 'psi-mi:MI:0414(enzymatic reaction)',
+                                     'psi-mi:MI:0914(Association)' = 'psi-mi:MI:0914(association)',
+                                     'psi-mi:MI:0915(physical_association)' = 'psi-mi:MI:0915(physical association)',
+                                     'psi-mi:MI:0218(physical interaction)' = 'psi-mi:MI:0915(physical association)'))%>%
+         dplyr::mutate(across(type, na_if, "-")) %>%
+         dplyr::group_by(ID_int) %>%
+         dplyr:: distinct() %>%
+         dplyr::group_by(ID_int) %>%
+         dplyr::filter(!(is.na(type)& sum(!is.na(type)) > 0)) %>%
+         dplyr::ungroup() %>%
+         dplyr::group_by(ID_int) %>%
+         dplyr:: mutate(type = paste(type, collapse = ","))%>%
+         dplyr:: distinct()
+
+a<-as.data.frame(table(dataset$type))
+
+
+
+
+
+
+
+
+
+
